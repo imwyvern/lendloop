@@ -1,0 +1,216 @@
+{
+  "id": "LendLoopNotify01",
+  "name": "LendLoop — Request notification",
+  "active": false,
+  "nodes": [
+    {
+      "id": "9ef288e7-4201-408a-8b9a-0ed04b3987c4",
+      "name": "Notification webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lendloop-notify",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "webhookId": "08270b62-a8c3-4b68-b1ef-5f2628a819e8",
+      "notes": "HMAC verification uses binary.data containing the original HTTP body bytes.",
+      "notesInFlow": true
+    },
+    {
+      "id": "5b8f9775-340d-4cf7-bb39-03cfc814357c",
+      "name": "Verify HMAC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        250,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const { createHmac, timingSafeEqual } = require('crypto');\nconst secret = $env.N8N_WEBHOOK_SECRET;\nif (!secret) throw new Error('N8N_WEBHOOK_SECRET is not configured');\nconst invalid = () => [{ json: { valid: false } }];\nconst input = $input.first();\nconst headers = input.json.headers ?? {};\nconst timestamp = headers['x-lendloop-timestamp'];\nconst signature = headers['x-lendloop-signature'];\nif (typeof timestamp !== 'string' || !/^\\d{1,12}$/.test(timestamp)) return invalid();\nif (Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp)) > 300) return invalid();\nif (typeof signature !== 'string' || !/^sha256=[a-fA-F0-9]{64}$/.test(signature)) return invalid();\n// rawBody=true stores the original bytes as binary.data. NEVER reserialize json.body.\nif (!input.binary?.data) return invalid();\nconst rawBody = await this.helpers.getBinaryDataBuffer(0, 'data');\nif (rawBody.length > 16384) return invalid();\nconst expected = createHmac('sha256', secret).update(timestamp + '.').update(rawBody).digest();\nconst received = Buffer.from(signature.slice(7), 'hex');\nif (received.length !== expected.length || !timingSafeEqual(received, expected)) return invalid();\nlet body;\ntry { body = JSON.parse(rawBody.toString('utf8')); } catch { return invalid(); }\nif (!body || typeof body !== 'object' || Array.isArray(body)) return invalid();\nconst bounds = {eventId:160,type:20,loanId:160,status:20,toolName:120,recipientName:120,recipientEmail:320,startDate:10,endDate:10};\nfor (const [key, max] of Object.entries(bounds)) {\n  if (typeof body[key] !== 'string' || !body[key].length || body[key].length > max) return invalid();\n}\nconst statuses = ['requested','approved','declined','returned','cancelled'];\nif (!statuses.includes(body.type) || body.status !== body.type) return invalid();\nif (!/^\\d{4}-\\d{2}-\\d{2}$/.test(body.startDate) || !/^\\d{4}-\\d{2}-\\d{2}$/.test(body.endDate)) return invalid();\n// Keep only the explicitly allowed fields, never arbitrary upstream data.\nconst payload = Object.fromEntries(Object.keys(bounds).map((key) => [key, body[key]]));\nreturn [{json:{valid:true,payload}}];"
+      }
+    },
+    {
+      "id": "9fde3c4b-0e56-470d-a7a0-6154f5b5094b",
+      "name": "Valid signature?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        500,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "861e309e-44db-417c-a152-2673770e7804",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "eb9a4fdd-b732-45f2-9aac-faf0cf920961",
+      "name": "Build message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        750,
+        -100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const payload = $input.first().json.payload;\nconst state = $getWorkflowStaticData('global');\nconst now = Date.now();\nconst recent = state.notificationEvents ?? {};\n// A small, best-effort replay cache, valid only for successful published runs.\nfor (const key of Object.keys(recent)) if (now - recent[key] > 600000) delete recent[key];\nstate.notificationEvents = recent;\nconst duplicate = Object.hasOwn(recent, 'notify:' + payload.eventId);\nreturn [{json:{...payload,duplicate,subject:'LendLoop: ' + payload.toolName + ' — ' + payload.status,\n  message:payload.recipientName + ', the ' + payload.startDate + ' to ' + payload.endDate + ' loan for ' + payload.toolName + ' is now ' + payload.status + '.'}}];"
+      }
+    },
+    {
+      "id": "52771a8b-e15b-410a-8a1d-7c4e817fe4ce",
+      "name": "Mock send notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        -100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = $input.first().json;\nif (!item.duplicate) {\n  // MOCK ONLY. Replace with your provider and pass eventId as its idempotency key.\n  // Contacts/message remain available in this node's input; omit them from logs.\n  console.log(JSON.stringify({channel:'mock',eventId:item.eventId,loanId:item.loanId,type:item.type}));\n  const state = $getWorkflowStaticData('global');\n  state.notificationEvents ??= {};\n  state.notificationEvents['notify:' + item.eventId] = Date.now();\n}\nreturn [{json:{ok:true,mock:true,eventId:item.eventId,duplicate:item.duplicate}}];"
+      },
+      "notes": "No external message is sent. Static-data replay suppression is best effort, not an atomic delivery lock. Use provider idempotency in production.",
+      "notesInFlow": true
+    },
+    {
+      "id": "cb537909-4ddf-4cd0-bb91-9d117f915cce",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1250,
+        -100
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "793c12d9-9ccc-457e-9ad9-5d9f50782087",
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        750,
+        150
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"error\":\"Unauthorized\"}",
+        "options": {
+          "responseCode": 401
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Notification webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify HMAC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify HMAC": {
+      "main": [
+        [
+          {
+            "node": "Valid signature?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid signature?": {
+      "main": [
+        [
+          {
+            "node": "Build message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 401",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build message": {
+      "main": [
+        [
+          {
+            "node": "Mock send notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mock send notification": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "errorWorkflow": "LendLoopErrors01",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "saveExecutionProgress": false,
+    "saveManualExecutions": false
+  },
+  "pinData": {},
+  "versionId": "838b984f-e166-4e1d-966d-21e3007dc2f5",
+  "tags": []
+}

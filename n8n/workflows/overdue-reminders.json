@@ -1,0 +1,294 @@
+{
+  "id": "LendLoopOverdue1",
+  "name": "LendLoop — Overdue reminders",
+  "active": false,
+  "nodes": [
+    {
+      "id": "18b93942-1a3b-4728-9a7b-4eb306a9efe6",
+      "name": "Daily 09:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "f3f047eb-32d9-419c-8314-72d2e9dfe6b8",
+      "name": "Sign overdue request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        250,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const { createHmac } = require('crypto');\nconst secret = $env.CONVEX_INBOUND_SECRET;\nconst baseUrl = $env.CONVEX_SITE_URL;\nif (!secret || !baseUrl) throw new Error('Configure CONVEX_INBOUND_SECRET and CONVEX_SITE_URL');\nconst rawBody = '{}';\nconst timestamp = String(Math.floor(Date.now() / 1000));\nconst signature = 'sha256=' + createHmac('sha256', secret).update(timestamp + '.' + rawBody).digest('hex');\nreturn [{json:{url:baseUrl.replace(/\\/+$/, '') + '/n8n/overdue',rawBody,timestamp,signature}}];"
+      }
+    },
+    {
+      "id": "061a3061-c7be-45a6-9efb-ece076a57e10",
+      "name": "Fetch overdue loans",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-LendLoop-Timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "X-LendLoop-Signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.rawBody }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "notes": "Three attempts total. The signed raw body is reused unchanged; retries complete inside the 300 second signature window.",
+      "notesInFlow": true
+    },
+    {
+      "id": "cf934ba1-80e0-4360-91b2-b5fe84f969f9",
+      "name": "Split and skip reminded",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        750,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const response = $input.first().json;\nif (!Array.isArray(response.loans)) throw new Error('Invalid overdue response: expected loans array');\nconst seen = new Set();\nconst items = [];\nfor (const loan of response.loans) {\n  if (!loan || typeof loan !== 'object' || typeof loan.alreadyReminded !== 'boolean') throw new Error('Invalid overdue loan');\n  for (const field of ['loanId','borrowerName','borrowerEmail','toolName','endDate','reminderKey']) {\n    if (typeof loan[field] !== 'string' || !loan[field]) throw new Error('Invalid overdue loan fields');\n  }\n  // Idempotent writebacks make completed reruns skip today's prior deliveries.\n  if (loan.alreadyReminded || seen.has(loan.reminderKey)) continue;\n  seen.add(loan.reminderKey);\n  items.push({json:{loanId:loan.loanId,borrowerName:loan.borrowerName,borrowerEmail:loan.borrowerEmail,toolName:loan.toolName,endDate:loan.endDate,reminderKey:loan.reminderKey},pairedItem:{item:0}});\n}\nreturn items;"
+      },
+      "notes": "alreadyReminded is based on the per-loan UTC-date reminder key. Also filters duplicate keys within one HTTP response.",
+      "notesInFlow": true
+    },
+    {
+      "id": "d000a014-74a2-4f88-ad35-0d11d7ba8a87",
+      "name": "Each overdue loan",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1000,
+        0
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "notes": "Process one loan at a time so each writeback receives a fresh timestamp immediately before its HTTP attempts. The done output is intentionally unconnected.",
+      "notesInFlow": true
+    },
+    {
+      "id": "ed45fc39-ee58-4666-bf08-381bd37b9e91",
+      "name": "Mock send reminder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1250,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().map((item, index) => {\n  const loan = item.json;\n  // MOCK ONLY. A real provider must deduplicate on reminderKey before sending.\n  const message = loan.borrowerName + ', please return ' + loan.toolName + '. It was due ' + loan.endDate + '.';\n  console.log(JSON.stringify({channel:'mock',kind:'overdue_reminder',loanId:loan.loanId,idempotencyKey:loan.reminderKey}));\n  // A message is built for the real-provider replacement but no contact/body is logged.\n  void message;\n  return {json:{loanId:loan.loanId,reminderKey:loan.reminderKey,mock:true},pairedItem:{item:index}};\n});"
+      },
+      "notes": "Only the HTTP nodes retry. Replaying an entire failed run after a send/writeback crash needs provider idempotency to avoid duplicate external messages.",
+      "notesInFlow": true
+    },
+    {
+      "id": "32e08622-de9a-4f62-87a0-fbe9ecdb1976",
+      "name": "Sign reminder writeback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1500,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const { createHmac } = require('crypto');\nconst secret = $env.CONVEX_INBOUND_SECRET;\nconst baseUrl = $env.CONVEX_SITE_URL;\nif (!secret || !baseUrl) throw new Error('Configure CONVEX_INBOUND_SECRET and CONVEX_SITE_URL');\nreturn $input.all().map((item, index) => {\n  const loan = item.json;\n  const rawBody = JSON.stringify({loanId:loan.loanId,kind:'overdue_reminder',status:'sent',idempotencyKey:loan.reminderKey,detail:'Mock overdue reminder logged by n8n'});\n  const timestamp = String(Math.floor(Date.now() / 1000));\n  const signature = 'sha256=' + createHmac('sha256', secret).update(timestamp + '.' + rawBody).digest('hex');\n  return {json:{url:baseUrl.replace(/\\/+$/, '') + '/n8n/events',rawBody,timestamp,signature},pairedItem:{item:index}};\n});"
+      }
+    },
+    {
+      "id": "0a4feec4-4ba9-4dab-a39c-e409dfa445b6",
+      "name": "Write reminder event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1750,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-LendLoop-Timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "X-LendLoop-Signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.rawBody }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "notes": "Three attempts total. The signed raw body is reused unchanged; retries complete inside the 300 second signature window.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Daily 09:00 UTC": {
+      "main": [
+        [
+          {
+            "node": "Sign overdue request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign overdue request": {
+      "main": [
+        [
+          {
+            "node": "Fetch overdue loans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch overdue loans": {
+      "main": [
+        [
+          {
+            "node": "Split and skip reminded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split and skip reminded": {
+      "main": [
+        [
+          {
+            "node": "Each overdue loan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mock send reminder": {
+      "main": [
+        [
+          {
+            "node": "Sign reminder writeback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign reminder writeback": {
+      "main": [
+        [
+          {
+            "node": "Write reminder event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Each overdue loan": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Mock send reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write reminder event": {
+      "main": [
+        [
+          {
+            "node": "Each overdue loan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "errorWorkflow": "LendLoopErrors01",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "saveExecutionProgress": false,
+    "saveManualExecutions": false
+  },
+  "pinData": {},
+  "versionId": "d8d95cd4-f28f-43f2-bf4e-ea95c1adbc7c",
+  "tags": []
+}

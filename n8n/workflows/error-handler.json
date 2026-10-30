@@ -1,0 +1,81 @@
+{
+  "id": "LendLoopErrors01",
+  "name": "LendLoop — Error handler",
+  "active": false,
+  "nodes": [
+    {
+      "id": "36d46c0f-740e-432e-8422-20b6f2142f08",
+      "name": "Workflow error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "e405e1a3-87db-4b80-86cc-8a76b4999d3c",
+      "name": "Format safe alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        250,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const input = $input.first().json;\nconst execution = input.execution ?? {};\nconst trigger = input.trigger ?? {};\nconst error = execution.error ?? trigger.error ?? {};\nlet message = String(error.message ?? 'Unknown workflow error');\n// Avoid exporting secrets, contact data, or the raw request in the alert.\nfor (const secret of [$env.N8N_WEBHOOK_SECRET,$env.CONVEX_INBOUND_SECRET,$env.N8N_ENCRYPTION_KEY]) {\n  if (secret) message = message.split(secret).join('[redacted]');\n}\nmessage = message.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi, '[email redacted]').slice(0, 500);\nlet executionUrl = String(execution.url ?? 'unavailable');\nexecutionUrl = executionUrl.split('?')[0].split('#')[0];\nreturn [{json:{workflow:String(input.workflow?.name ?? input.workflow?.id ?? 'unknown'),node:String(execution.lastNodeExecuted ?? error.node?.name ?? 'trigger'),executionUrl,message}}];"
+      }
+    },
+    {
+      "id": "4527f8b7-bfb8-4200-93ff-55b6f71a7969",
+      "name": "Mock alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const alert = $input.first().json;\nconsole.error(JSON.stringify({level:'error',source:'lendloop-automation',...alert}));\n// MOCK ALERT ONLY. Replace with your monitoring provider after configuration.\nreturn [{json:{...alert,alertChannel:'mock-log'}}];"
+      }
+    }
+  ],
+  "connections": {
+    "Workflow error": {
+      "main": [
+        [
+          {
+            "node": "Format safe alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format safe alert": {
+      "main": [
+        [
+          {
+            "node": "Mock alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "saveExecutionProgress": false,
+    "saveManualExecutions": false
+  },
+  "pinData": {},
+  "versionId": "2a178c2c-1c69-4c40-897a-b03dd10c153c",
+  "tags": []
+}
